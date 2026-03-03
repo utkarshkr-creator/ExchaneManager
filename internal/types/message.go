@@ -127,7 +127,7 @@ func (d *DepthMessage) DEPTH() *DepthMessage {
 }
 
 type GetBalanceMessage struct {
-	UserBalance int64 `json:"userBalance"`
+	UserBalance string `json:"userBalance"`
 }
 
 func (g *GetBalanceMessage) GET_BALANCE() *GetBalanceMessage {

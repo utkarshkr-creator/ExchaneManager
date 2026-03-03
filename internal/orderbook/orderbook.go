@@ -9,10 +9,21 @@ import (
 type Orderbook struct {
 	Bids         []types.Order
 	Asks         []types.Order
-	BaseAsset    string
 	QuoteAsset   string
+	BaseAsset    string
 	LastTradeId  int64
 	CurrentPrice int64
+}
+
+func NewOrderbook(baseAsset string, quoteAsset string, bids []types.Order, asks []types.Order, lastTradeId int64, currentPrice int64) *Orderbook {
+	return &Orderbook{
+		Bids:         bids,
+		Asks:         asks,
+		BaseAsset:    baseAsset,
+		LastTradeId:  lastTradeId,
+		QuoteAsset:   quoteAsset,
+		CurrentPrice: currentPrice,
+	}
 }
 
 func (ob *Orderbook) Ticker() string {
