@@ -13,14 +13,17 @@ import (
 	"exchangeManager/internal/orderbook"
 	redismgr "exchangeManager/internal/redis"
 	"exchangeManager/internal/types"
+	"sync"
 )
 
 const BaseCurrency = types.BaseCurrency
 
 type Engine struct {
-	Orderbooks []*orderbook.Orderbook       `json:"orderbooks"`
-	PriceList  map[string]int64             `json:"priceList"`
-	Balances   map[string]types.UserBalance `json:"balances"`
+	Orderbooks   []*orderbook.Orderbook       `json:"orderbooks"`
+	orderbooksMu sync.RWMutex                 `json:"-"`
+	PriceList    map[string]int64             `json:"priceList"`
+	Balances     map[string]types.UserBalance `json:"balances"`
+	balanceMu    sync.RWMutex                 `json:"-"`
 }
 
 func saveSnapshot(engine *Engine) {
@@ -29,7 +32,7 @@ func saveSnapshot(engine *Engine) {
 		fmt.Println("Failed to marshal snapshot:", err)
 		return
 	}
-	if err := os.WriteFile("./snapshot.json", data, 0644); err != nil {
+	if err := os.WriteFile("/app/data/snapshot.json", data, 0644); err != nil {
 		fmt.Println("Failed to write snapshot:", err)
 	}
 }
@@ -38,12 +41,18 @@ func NewEngine() (*Engine, error) {
 	var engine *Engine
 
 	if os.Getenv("WITH_SNAPSHOT") == "true" {
-		data, err := os.ReadFile("./snapshot.json")
+		data, err := os.ReadFile("/app/data/snapshot.json")
 		if err != nil {
 			fmt.Println("No snapshot found:", err)
 		} else {
 			if err := json.Unmarshal(data, &engine); err != nil {
 				fmt.Println("Failed to parse snapshot:", err)
+			} else {
+				// Re-initialize channels and background routines for restored orderbooks
+				for _, ob := range engine.Orderbooks {
+					ob.Tasks = make(chan func(), 1000)
+					go ob.Start()
+				}
 			}
 		}
 	}
@@ -74,10 +83,14 @@ func NewEngine() (*Engine, error) {
 // ---------------------------------------------------------------------------
 
 func (e *Engine) addOrderbook(ob *orderbook.Orderbook) {
+	e.orderbooksMu.Lock()
+	defer e.orderbooksMu.Unlock()
 	e.Orderbooks = append(e.Orderbooks, ob)
 }
 
 func (e *Engine) getOrderbook(market string) *orderbook.Orderbook {
+	e.orderbooksMu.RLock()
+	defer e.orderbooksMu.RUnlock()
 	for _, ob := range e.Orderbooks {
 		if ob.Ticker() == market {
 			return ob
@@ -87,6 +100,8 @@ func (e *Engine) getOrderbook(market string) *orderbook.Orderbook {
 }
 
 func (e *Engine) getBalance(userId string, asset string) string {
+	e.balanceMu.RLock()
+	defer e.balanceMu.RUnlock()
 	ub, ok := e.Balances[userId]
 	if !ok {
 		return "0"
@@ -148,7 +163,7 @@ func (e *Engine) Process(message types.MessageFromApi, clientId string) {
 		}
 		result, err := e.createOrder(data.Market, data.Price, data.Quantity, data.Side, data.UserId)
 		if err != nil {
-			fmt.Println("Error in order placing:", err)
+			fmt.Printf("Error in order placing: %v (market=%s, price=%s, qty=%s, side=%s, userId=%s)\n", err, data.Market, data.Price, data.Quantity, data.Side, data.UserId)
 			payload, _ := json.Marshal(types.OrderCancelledMessage{OrderId: "", ExecutedQty: 0, RemainingQty: 0})
 			rm.SendToApi(ctx, clientId, types.MessageToApi{Type: "ORDER_CANCELLED", Data: payload})
 			return
@@ -181,8 +196,18 @@ func (e *Engine) Process(message types.MessageFromApi, clientId string) {
 			fmt.Println("No orderbook found for", data.Market)
 			return
 		}
-		orders := ob.GetOpenOrders(data.UserId)
-		payload, _ := json.Marshal(types.OpenOrdersMessage{Orders: orders})
+		var orders []types.Order
+		done := make(chan struct{})
+		ob.Tasks <- func() {
+			orders = ob.GetOpenOrders(data.UserId)
+			close(done)
+		}
+		<-done
+
+		if orders == nil {
+			orders = []types.Order{}
+		}
+		payload, _ := json.Marshal(orders)
 		rm.SendToApi(ctx, clientId, types.MessageToApi{Type: "OPEN_ORDERS", Data: payload})
 
 	case types.ON_RAMP:
@@ -206,7 +231,13 @@ func (e *Engine) Process(message types.MessageFromApi, clientId string) {
 			rm.SendToApi(ctx, clientId, types.MessageToApi{Type: "DEPTH", Data: payload})
 			return
 		}
-		depth := ob.GetDepth()
+		var depth types.DepthMessage
+		done := make(chan struct{})
+		ob.Tasks <- func() {
+			depth = ob.GetDepth()
+			close(done)
+		}
+		<-done
 		payload, _ := json.Marshal(depth)
 		rm.SendToApi(ctx, clientId, types.MessageToApi{Type: "DEPTH", Data: payload})
 	}
@@ -239,6 +270,7 @@ func (e *Engine) createOrder(market, priceStr, quantityStr, side, userId string)
 	quantity, _ := strconv.ParseInt(quantityStr, 10, 64)
 
 	if err := e.checkAndLockFunds(baseAsset, quoteAsset, side, userId, price, quantity); err != nil {
+		fmt.Printf("createOrder failed at checkAndLockFunds: %v\n", err)
 		return nil, err
 	}
 
@@ -250,27 +282,32 @@ func (e *Engine) createOrder(market, priceStr, quantityStr, side, userId string)
 		UserID:   userId,
 	}
 
-	result := ob.AddOrder(order)
-	fills := result.Fills
-	executedQty := result.ExecutedQty
+	ch := make(chan *createOrderResult)
+	ob.Tasks <- func() {
+		result := ob.AddOrder(order)
+		fills := result.Fills
+		executedQty := result.ExecutedQty
 
-	ctx := context.Background()
+		ctx := context.Background()
 
-	e.updateBalance(userId, baseAsset, quoteAsset, side, fills)
-	e.createDbTrades(ctx, fills, market, userId)
-	e.updateDbOrders(ctx, result, executedQty, fills, market)
-	e.publishWsDepthUpdates(ctx, fills, priceStr, side, market)
-	if len(fills) > 0 {
-		lastPrice := strconv.FormatInt(fills[len(fills)-1].Price, 10)
-		e.publishWsPriceUpdates(ctx, market, lastPrice)
+		e.updateBalance(userId, baseAsset, quoteAsset, side, fills)
+		e.createDbTrades(ctx, fills, market, userId)
+		e.updateDbOrders(ctx, result, executedQty, fills, market)
+		e.publishWsDepthUpdates(ctx, fills, priceStr, side, market)
+		if len(fills) > 0 {
+			lastPrice := strconv.FormatInt(fills[len(fills)-1].Price, 10)
+			e.publishWsPriceUpdates(ctx, market, lastPrice)
+		}
+		e.publishWsTrades(ctx, fills, userId, market)
+
+		ch <- &createOrderResult{
+			ExecutedQty: executedQty,
+			Fills:       fills,
+			OrderId:     result.OrderID,
+		}
 	}
-	e.publishWsTrades(ctx, fills, userId, market)
 
-	return &createOrderResult{
-		ExecutedQty: executedQty,
-		Fills:       fills,
-		OrderId:     result.OrderID,
-	}, nil
+	return <-ch, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -292,46 +329,60 @@ func (e *Engine) cancelOrder(ctx context.Context, orderId string, market string)
 	baseAsset := parts[0]
 	quoteAsset := parts[1]
 
-	// Try to find the order in asks or bids.
-	var order *types.Order
-	for i := range ob.Asks {
-		if ob.Asks[i].OrderID == orderId {
-			order = &ob.Asks[i]
-			break
-		}
-	}
-	if order == nil {
-		for i := range ob.Bids {
-			if ob.Bids[i].OrderID == orderId {
-				order = &ob.Bids[i]
+	done := make(chan struct{})
+	ob.Tasks <- func() {
+		defer close(done)
+
+		// Try to find the order in asks or bids.
+		var order *types.Order
+		for i := range ob.Asks {
+			if ob.Asks[i].OrderID == orderId {
+				order = &ob.Asks[i]
 				break
 			}
 		}
-	}
-	if order == nil {
-		fmt.Println("No order found:", orderId)
-		return
-	}
+		if order == nil {
+			for i := range ob.Bids {
+				if ob.Bids[i].OrderID == orderId {
+					order = &ob.Bids[i]
+					break
+				}
+			}
+		}
+		if order == nil {
+			fmt.Println("No order found:", orderId)
+			return
+		}
 
-	if order.Side == types.SideBuy {
-		price, found := ob.CancelBid(orderId)
-		leftQuantity := (order.Quantity - order.ExecutedQty) * order.Price
-		e.ensureBalance(order.UserID, quoteAsset)
-		e.Balances[order.UserID][quoteAsset].Available += leftQuantity
-		e.Balances[order.UserID][quoteAsset].Locked -= leftQuantity
-		if found {
-			e.sendUpdatedDepthAt(ctx, strconv.FormatInt(price, 10), market)
-		}
-	} else {
-		price, found := ob.CancelAsk(orderId)
-		leftQuantity := order.Quantity - order.ExecutedQty
-		e.ensureBalance(order.UserID, baseAsset)
-		e.Balances[order.UserID][baseAsset].Available += leftQuantity
-		e.Balances[order.UserID][baseAsset].Locked -= leftQuantity
-		if found {
-			e.sendUpdatedDepthAt(ctx, strconv.FormatInt(price, 10), market)
+		if order.Side == types.SideBuy {
+			price, found := ob.CancelBid(orderId)
+			leftQuantity := (order.Quantity - order.ExecutedQty) * order.Price
+
+			e.balanceMu.Lock()
+			e.ensureBalance(order.UserID, quoteAsset)
+			e.Balances[order.UserID][quoteAsset].Available += leftQuantity
+			e.Balances[order.UserID][quoteAsset].Locked -= leftQuantity
+			e.balanceMu.Unlock()
+
+			if found {
+				e.sendUpdatedDepthAt(ctx, strconv.FormatInt(price, 10), market)
+			}
+		} else {
+			price, found := ob.CancelAsk(orderId)
+			leftQuantity := order.Quantity - order.ExecutedQty
+
+			e.balanceMu.Lock()
+			e.ensureBalance(order.UserID, baseAsset)
+			e.Balances[order.UserID][baseAsset].Available += leftQuantity
+			e.Balances[order.UserID][baseAsset].Locked -= leftQuantity
+			e.balanceMu.Unlock()
+
+			if found {
+				e.sendUpdatedDepthAt(ctx, strconv.FormatInt(price, 10), market)
+			}
 		}
 	}
+	<-done
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +390,7 @@ func (e *Engine) cancelOrder(ctx context.Context, orderId string, market string)
 // ---------------------------------------------------------------------------
 
 func (e *Engine) ensureBalance(userId string, asset string) {
+	// Must be called with e.balanceMu held (Lock)
 	if _, ok := e.Balances[userId]; !ok {
 		e.Balances[userId] = make(types.UserBalance)
 	}
@@ -348,15 +400,20 @@ func (e *Engine) ensureBalance(userId string, asset string) {
 }
 
 func (e *Engine) onRamp(userId string, amount int64) {
+	e.balanceMu.Lock()
+	defer e.balanceMu.Unlock()
 	e.ensureBalance(userId, BaseCurrency)
 	e.Balances[userId][BaseCurrency].Available += amount
 }
 
 func (e *Engine) checkAndLockFunds(baseAsset, quoteAsset, side string, userId string, price, quantity int64) error {
+	e.balanceMu.Lock()
+	defer e.balanceMu.Unlock()
 	totalPrice := quantity * price
 	if side == "buy" {
 		e.ensureBalance(userId, quoteAsset)
 		if e.Balances[userId][quoteAsset].Available < totalPrice {
+			fmt.Printf("checkAndLockFunds: Buy failed - user %s has %d %s available, needs %d\n", userId, e.Balances[userId][quoteAsset].Available, quoteAsset, totalPrice)
 			return types.ErrInsufficientFunds
 		}
 		e.Balances[userId][quoteAsset].Available -= totalPrice
@@ -364,6 +421,7 @@ func (e *Engine) checkAndLockFunds(baseAsset, quoteAsset, side string, userId st
 	} else {
 		e.ensureBalance(userId, baseAsset)
 		if e.Balances[userId][baseAsset].Available < quantity {
+			fmt.Printf("checkAndLockFunds: Sell failed - user %s has %d %s available, needs %d\n", userId, e.Balances[userId][baseAsset].Available, baseAsset, quantity)
 			return types.ErrInsufficientFunds
 		}
 		e.Balances[userId][baseAsset].Available -= quantity
@@ -373,6 +431,8 @@ func (e *Engine) checkAndLockFunds(baseAsset, quoteAsset, side string, userId st
 }
 
 func (e *Engine) updateBalance(userId, baseAsset, quoteAsset, side string, fills []types.Fill) {
+	e.balanceMu.Lock()
+	defer e.balanceMu.Unlock()
 	if side == "buy" {
 		for _, fill := range fills {
 			totalValue := fill.Quantity * fill.Price
@@ -409,15 +469,17 @@ func (e *Engine) updateBalance(userId, baseAsset, quoteAsset, side string, fills
 }
 
 func (e *Engine) setBaseBalances() {
+	e.balanceMu.Lock()
+	defer e.balanceMu.Unlock()
 	users := []string{"1", "2", "3", "6", "7"}
 	for _, uid := range users {
 		e.Balances[uid] = types.UserBalance{
-			BaseCurrency: {Available: 1000000000000000, Locked: 0},
-			"TATA":       {Available: 100000000, Locked: 0},
+			// 10,000,000 INR scaled by 1e6
+			BaseCurrency: {Available: 10_000_000_000_000_000, Locked: 0},
+			// 10,000 TATA scaled by 1e6
+			"TATA": {Available: 10_000_000_000_000, Locked: 0},
 		}
 	}
-	// User "1" gets extra base currency
-	e.Balances["1"][BaseCurrency].Available = 1000000000000000
 }
 
 // ---------------------------------------------------------------------------

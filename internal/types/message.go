@@ -95,7 +95,7 @@ func (g *GetOpenOrdersData) GET_OPEN_ORDERS_DATA() *GetOpenOrdersData {
 // TO API
 type MessageToApi struct {
 	Type string          `json:"type"`
-	Data json.RawMessage `json:"data"`
+	Data json.RawMessage `json:"payload"`
 }
 
 type MessageToApiData interface {

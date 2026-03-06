@@ -13,16 +13,26 @@ type Orderbook struct {
 	BaseAsset    string
 	LastTradeId  int64
 	CurrentPrice int64
+	Tasks        chan func() `json:"-"`
 }
 
 func NewOrderbook(baseAsset string, quoteAsset string, bids []types.Order, asks []types.Order, lastTradeId int64, currentPrice int64) *Orderbook {
-	return &Orderbook{
+	ob := &Orderbook{
 		Bids:         bids,
 		Asks:         asks,
 		BaseAsset:    baseAsset,
 		LastTradeId:  lastTradeId,
 		QuoteAsset:   quoteAsset,
 		CurrentPrice: currentPrice,
+		Tasks:        make(chan func(), 1000), // Buffered channel for tasks
+	}
+	go ob.Start()
+	return ob
+}
+
+func (ob *Orderbook) Start() {
+	for task := range ob.Tasks {
+		task()
 	}
 }
 

@@ -1,0 +1,67 @@
+{
+  "orderbooks": [
+    {
+      "Bids": null,
+      "Asks": null,
+      "QuoteAsset": "INR",
+      "BaseAsset": "TATA",
+      "LastTradeId": 0,
+      "CurrentPrice": 138
+    }
+  ],
+  "priceList": {
+    "TATA": 138
+  },
+  "balances": {
+    "1": {
+      "INR": {
+        "Available": 1000000000000000,
+        "Locked": 0
+      },
+      "TATA": {
+        "Available": 100000000,
+        "Locked": 0
+      }
+    },
+    "2": {
+      "INR": {
+        "Available": 1000000000000000,
+        "Locked": 0
+      },
+      "TATA": {
+        "Available": 100000000,
+        "Locked": 0
+      }
+    },
+    "3": {
+      "INR": {
+        "Available": 1000000000000000,
+        "Locked": 0
+      },
+      "TATA": {
+        "Available": 100000000,
+        "Locked": 0
+      }
+    },
+    "6": {
+      "INR": {
+        "Available": 1000000000000000,
+        "Locked": 0
+      },
+      "TATA": {
+        "Available": 100000000,
+        "Locked": 0
+      }
+    },
+    "7": {
+      "INR": {
+        "Available": 1000000000000000,
+        "Locked": 0
+      },
+      "TATA": {
+        "Available": 100000000,
+        "Locked": 0
+      }
+    }
+  }
+}
